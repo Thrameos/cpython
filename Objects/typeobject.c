@@ -370,6 +370,44 @@ type_mro_modified(PyTypeObject *type, PyObject *bases) {
                         Py_TPFLAGS_VALID_VERSION_TAG);
 }
 
+static void
+type_mro_check_si(PyTypeObject *type, PyObject *mro) {
+    /* Check if fast type issubclass check can be enabled for this type.
+    */
+    Py_ssize_t i, n, n2, n3;
+    PyObject *base, *mro2;
+
+    /* Clear the flag if we entered this due to an mro change. */
+    type->tp_flags &= ~Py_TPFLAGS_SINGLE_INHERITED;
+
+    assert(PyTuple_Check(mro));
+    n = PyTuple_GET_SIZE(mro);
+
+    /* Check every possible issubclass in advance */
+    for (i = 0; i < n; i++) {
+        base = PyTuple_GET_ITEM(mro, i);
+        mro2 = ((PyTypeObject *) base)->tp_mro;
+
+        /* if the parent mro is invalid, use the slow method */
+        if (mro2 == NULL)
+            return;
+        assert(PyTuple_Check(mro2));
+        n2 = PyTuple_GET_SIZE(mro2);
+
+        /* broken inheritance tree, use the slow method */
+        if (n2 > n)
+           return;
+        n3 = n - n2;
+
+        /* if we can't check inheritance directly, use the slow method. */
+        if (PyTuple_GET_ITEM(mro, n3) != base)
+           return;
+    }
+
+    /* all issubclass types checked in the mro, we can use fast method. */
+    type->tp_flags |= Py_TPFLAGS_SINGLE_INHERITED;
+}
+
 #ifdef MCACHE
 static int
 assign_version_tag(PyTypeObject *type)
@@ -1415,24 +1453,54 @@ type_is_subtype_base_chain(PyTypeObject *a, PyTypeObject *b)
 int
 PyType_IsSubtype(PyTypeObject *a, PyTypeObject *b)
 {
-    PyObject *mro;
+    PyObject *mro, *mro2;
 
     mro = a->tp_mro;
-    if (mro != NULL) {
-        /* Deal with multiple inheritance without recursion
-           by walking the MRO tuple */
-        Py_ssize_t i, n;
-        assert(PyTuple_Check(mro));
-        n = PyTuple_GET_SIZE(mro);
-        for (i = 0; i < n; i++) {
-            if (PyTuple_GET_ITEM(mro, i) == (PyObject *)b)
-                return 1;
-        }
-        return 0;
-    }
-    else
+    if (mro == NULL) {
         /* a is not completely initialized yet; follow tp_base */
         return type_is_subtype_base_chain(a, b);
+    }
+    else if ( PyType_HasFeature(a, Py_TPFLAGS_SINGLE_INHERITED)) {
+        Py_ssize_t n1, n2, n3;
+        mro2 = b->tp_mro;
+
+        /* In some odd cases, type b is still being constructed.  Since every parent must
+	 * be constructed, a can't be inherited from b.
+	 */
+	if (mro2 == NULL)
+            return 0;
+
+        /* Unresolved:
+           - Can b be NULL?
+             It shouldn't be possible as we had to check all the subtypes in order to set the flag.
+           - Can b->mro be a non-tuple?
+             Potentially it could be set after we verified the inheritance tree, but perhaps the 
+             mro setter should screen against this.  Need to examine the code.
+        */
+        assert(PyTuple_Check(mro));
+        assert(PyTuple_Check(mro2));
+        n1 = PyTuple_GET_SIZE(mro);
+        n2 = PyTuple_GET_SIZE(mro2);
+
+        // If the parent mro is longer, then it can't be a subtype
+        if (n2 > n1)
+            return 0;
+
+        // Compute the expected position and return if that position is a match.
+        n3 = n1 - n2;
+        return (PyTuple_GET_ITEM(mro, n3) == (PyObject *)b) ? 1 : 0;
+    }
+
+    /* Deal with multiple inheritance without recursion
+       by walking the MRO tuple */
+    Py_ssize_t i, n;
+    assert(PyTuple_Check(mro));
+    n = PyTuple_GET_SIZE(mro);
+    for (i = 0; i < n; i++) {
+        if (PyTuple_GET_ITEM(mro, i) == (PyObject *)b)
+            return 1;
+    }
+    return 0;
 }
 
 /* Routines to do a method lookup in the type without looking in the
@@ -2025,6 +2093,12 @@ mro_internal(PyTypeObject *type, PyObject **p_old_mro)
     /* corner case: the super class might have been hidden
        from the custom MRO */
     type_mro_modified(type, type->tp_bases);
+
+    /* Check for strict inheritance and set flag appropriately */
+    /* FIXME it is not clear if the strict type check belongs here
+     * or in PyType_Modified.
+     */
+    type_mro_check_si(type, type->tp_mro);
 
     PyType_Modified(type);
 
