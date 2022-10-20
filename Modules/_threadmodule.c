@@ -3,18 +3,39 @@
 /* Interface to Sjoerd's portable C thread library */
 
 #include "Python.h"
+#include "pycore_interp.h"        // _PyInterpreterState.threads.count
+#include "pycore_moduleobject.h"  // _PyModule_GetState()
 #include "pycore_pylifecycle.h"
-#include "pycore_interp.h"        // _PyInterpreterState.num_threads
-#include "pycore_pystate.h"       // _PyThreadState_Init()
+#include "pycore_pystate.h"       // _PyThreadState_SetCurrent()
 #include <stddef.h>               // offsetof()
+#include "structmember.h"         // PyMemberDef
+
+#ifdef HAVE_SIGNAL_H
+#  include <signal.h>             // SIGINT
+#endif
 
 // ThreadError is just an alias to PyExc_RuntimeError
 #define ThreadError PyExc_RuntimeError
 
-_Py_IDENTIFIER(__dict__);
 
-_Py_IDENTIFIER(stderr);
-_Py_IDENTIFIER(flush);
+// Forward declarations
+static struct PyModuleDef thread_module;
+
+
+typedef struct {
+    PyTypeObject *excepthook_type;
+    PyTypeObject *lock_type;
+    PyTypeObject *local_type;
+    PyTypeObject *local_dummy_type;
+} thread_module_state;
+
+static inline thread_module_state*
+get_thread_state(PyObject *module)
+{
+    void *state = _PyModule_GetState(module);
+    assert(state != NULL);
+    return (thread_module_state *)state;
+}
 
 
 /* Lock objects */
@@ -26,9 +47,17 @@ typedef struct {
     char locked; /* for sanity checking */
 } lockobject;
 
+static int
+lock_traverse(lockobject *self, visitproc visit, void *arg)
+{
+    Py_VISIT(Py_TYPE(self));
+    return 0;
+}
+
 static void
 lock_dealloc(lockobject *self)
 {
+    PyObject_GC_UnTrack(self);
     if (self->in_weakreflist != NULL) {
         PyObject_ClearWeakRefs((PyObject *) self);
     }
@@ -38,7 +67,9 @@ lock_dealloc(lockobject *self)
             PyThread_release_lock(self->lock_lock);
         PyThread_free_lock(self->lock_lock);
     }
-    PyObject_Free(self);
+    PyTypeObject *tp = Py_TYPE(self);
+    tp->tp_free((PyObject*)self);
+    Py_DECREF(tp);
 }
 
 /* Helper to acquire an interruptible lock with a timeout.  If the lock acquire
@@ -50,13 +81,12 @@ lock_dealloc(lockobject *self)
 static PyLockStatus
 acquire_timed(PyThread_type_lock lock, _PyTime_t timeout)
 {
-    PyLockStatus r;
     _PyTime_t endtime = 0;
-
     if (timeout > 0) {
-        endtime = _PyTime_GetMonotonicClock() + timeout;
+        endtime = _PyDeadline_Init(timeout);
     }
 
+    PyLockStatus r;
     do {
         _PyTime_t microseconds;
         microseconds = _PyTime_AsMicroseconds(timeout, _PyTime_ROUND_CEILING);
@@ -80,7 +110,7 @@ acquire_timed(PyThread_type_lock lock, _PyTime_t timeout)
             /* If we're using a timeout, recompute the timeout after processing
              * signals, since those can take time.  */
             if (timeout > 0) {
-                timeout = endtime - _PyTime_GetMonotonicClock();
+                timeout = _PyDeadline_Get(endtime);
 
                 /* Check for negative values, since those mean block forever.
                  */
@@ -130,7 +160,7 @@ lock_acquire_parse_args(PyObject *args, PyObject *kwds,
         _PyTime_t microseconds;
 
         microseconds = _PyTime_AsMicroseconds(*timeout, _PyTime_ROUND_TIMEOUT);
-        if (microseconds >= PY_TIMEOUT_MAX) {
+        if (microseconds > PY_TIMEOUT_MAX) {
             PyErr_SetString(PyExc_OverflowError,
                             "timeout value is too large");
             return -1;
@@ -225,9 +255,9 @@ lock__at_fork_reinit(lockobject *self, PyObject *Py_UNUSED(args))
 
 
 static PyMethodDef lock_methods[] = {
-    {"acquire_lock", (PyCFunction)(void(*)(void))lock_PyThread_acquire_lock,
+    {"acquire_lock", _PyCFunction_CAST(lock_PyThread_acquire_lock),
      METH_VARARGS | METH_KEYWORDS, acquire_doc},
-    {"acquire",      (PyCFunction)(void(*)(void))lock_PyThread_acquire_lock,
+    {"acquire",      _PyCFunction_CAST(lock_PyThread_acquire_lock),
      METH_VARARGS | METH_KEYWORDS, acquire_doc},
     {"release_lock", (PyCFunction)lock_PyThread_release_lock,
      METH_NOARGS, release_doc},
@@ -237,7 +267,7 @@ static PyMethodDef lock_methods[] = {
      METH_NOARGS, locked_doc},
     {"locked",       (PyCFunction)lock_locked_lock,
      METH_NOARGS, locked_doc},
-    {"__enter__",    (PyCFunction)(void(*)(void))lock_PyThread_acquire_lock,
+    {"__enter__",    _PyCFunction_CAST(lock_PyThread_acquire_lock),
      METH_VARARGS | METH_KEYWORDS, acquire_doc},
     {"__exit__",    (PyCFunction)lock_PyThread_release_lock,
      METH_VARARGS, release_doc},
@@ -260,16 +290,27 @@ A lock is not owned by the thread that locked it; another thread may\n\
 unlock it.  A thread attempting to lock a lock that it has already locked\n\
 will block until another thread unlocks it.  Deadlocks may ensue.");
 
-static PyTypeObject Locktype = {
-    PyVarObject_HEAD_INIT(&PyType_Type, 0)
-    .tp_name = "_thread.lock",
-    .tp_basicsize = sizeof(lockobject),
-    .tp_dealloc = (destructor)lock_dealloc,
-    .tp_repr = (reprfunc)lock_repr,
-    .tp_flags = Py_TPFLAGS_DEFAULT,
-    .tp_doc = lock_doc,
-    .tp_weaklistoffset = offsetof(lockobject, in_weakreflist),
-    .tp_methods = lock_methods,
+static PyMemberDef lock_type_members[] = {
+    {"__weaklistoffset__", T_PYSSIZET, offsetof(lockobject, in_weakreflist), READONLY},
+    {NULL},
+};
+
+static PyType_Slot lock_type_slots[] = {
+    {Py_tp_dealloc, (destructor)lock_dealloc},
+    {Py_tp_repr, (reprfunc)lock_repr},
+    {Py_tp_doc, (void *)lock_doc},
+    {Py_tp_methods, lock_methods},
+    {Py_tp_traverse, lock_traverse},
+    {Py_tp_members, lock_type_members},
+    {0, 0}
+};
+
+static PyType_Spec lock_type_spec = {
+    .name = "_thread.lock",
+    .basicsize = sizeof(lockobject),
+    .flags = (Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC |
+              Py_TPFLAGS_DISALLOW_INSTANTIATION | Py_TPFLAGS_IMMUTABLETYPE),
+    .slots = lock_type_slots,
 };
 
 /* Recursive lock objects */
@@ -282,9 +323,18 @@ typedef struct {
     PyObject *in_weakreflist;
 } rlockobject;
 
+static int
+rlock_traverse(rlockobject *self, visitproc visit, void *arg)
+{
+    Py_VISIT(Py_TYPE(self));
+    return 0;
+}
+
+
 static void
 rlock_dealloc(rlockobject *self)
 {
+    PyObject_GC_UnTrack(self);
     if (self->in_weakreflist != NULL)
         PyObject_ClearWeakRefs((PyObject *) self);
     /* self->rlock_lock can be NULL if PyThread_allocate_lock() failed
@@ -296,7 +346,9 @@ rlock_dealloc(rlockobject *self)
 
         PyThread_free_lock(self->rlock_lock);
     }
-    Py_TYPE(self)->tp_free(self);
+    PyTypeObject *tp = Py_TYPE(self);
+    tp->tp_free(self);
+    Py_DECREF(tp);
 }
 
 static PyObject *
@@ -498,7 +550,7 @@ rlock__at_fork_reinit(rlockobject *self, PyObject *Py_UNUSED(args))
 
 
 static PyMethodDef rlock_methods[] = {
-    {"acquire",      (PyCFunction)(void(*)(void))rlock_acquire,
+    {"acquire",      _PyCFunction_CAST(rlock_acquire),
      METH_VARARGS | METH_KEYWORDS, rlock_acquire_doc},
     {"release",      (PyCFunction)rlock_release,
      METH_NOARGS, rlock_release_doc},
@@ -508,7 +560,7 @@ static PyMethodDef rlock_methods[] = {
      METH_VARARGS, rlock_acquire_restore_doc},
     {"_release_save", (PyCFunction)rlock_release_save,
      METH_NOARGS, rlock_release_save_doc},
-    {"__enter__",    (PyCFunction)(void(*)(void))rlock_acquire,
+    {"__enter__",    _PyCFunction_CAST(rlock_acquire),
      METH_VARARGS | METH_KEYWORDS, rlock_acquire_doc},
     {"__exit__",    (PyCFunction)rlock_release,
      METH_VARARGS, rlock_release_doc},
@@ -520,23 +572,37 @@ static PyMethodDef rlock_methods[] = {
 };
 
 
-static PyTypeObject RLocktype = {
-    PyVarObject_HEAD_INIT(&PyType_Type, 0)
-    .tp_name = "_thread.RLock",
-    .tp_basicsize = sizeof(rlockobject),
-    .tp_dealloc = (destructor)rlock_dealloc,
-    .tp_repr = (reprfunc)rlock_repr,
-    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
-    .tp_weaklistoffset = offsetof(rlockobject, in_weakreflist),
-    .tp_methods = rlock_methods,
-    .tp_alloc = PyType_GenericAlloc,
-    .tp_new = rlock_new,
+static PyMemberDef rlock_type_members[] = {
+    {"__weaklistoffset__", T_PYSSIZET, offsetof(rlockobject, in_weakreflist), READONLY},
+    {NULL},
+};
+
+static PyType_Slot rlock_type_slots[] = {
+    {Py_tp_dealloc, (destructor)rlock_dealloc},
+    {Py_tp_repr, (reprfunc)rlock_repr},
+    {Py_tp_methods, rlock_methods},
+    {Py_tp_alloc, PyType_GenericAlloc},
+    {Py_tp_new, rlock_new},
+    {Py_tp_members, rlock_type_members},
+    {Py_tp_traverse, rlock_traverse},
+    {0, 0},
+};
+
+static PyType_Spec rlock_type_spec = {
+    .name = "_thread.RLock",
+    .basicsize = sizeof(rlockobject),
+    .flags = (Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE |
+              Py_TPFLAGS_HAVE_GC | Py_TPFLAGS_IMMUTABLETYPE),
+    .slots = rlock_type_slots,
 };
 
 static lockobject *
-newlockobject(void)
+newlockobject(PyObject *module)
 {
-    lockobject *self = PyObject_New(lockobject, &Locktype);
+    thread_module_state *state = get_thread_state(module);
+
+    PyTypeObject *type = state->lock_type;
+    lockobject *self = (lockobject *)type->tp_alloc(type, 0);
     if (self == NULL) {
         return NULL;
     }
@@ -605,17 +671,29 @@ localdummy_dealloc(localdummyobject *self)
 {
     if (self->weakreflist != NULL)
         PyObject_ClearWeakRefs((PyObject *) self);
-    Py_TYPE(self)->tp_free((PyObject*)self);
+    PyTypeObject *tp = Py_TYPE(self);
+    tp->tp_free((PyObject*)self);
+    Py_DECREF(tp);
 }
 
-static PyTypeObject localdummytype = {
-    PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "_thread._localdummy",
-    .tp_basicsize = sizeof(localdummyobject),
-    .tp_dealloc = (destructor)localdummy_dealloc,
-    .tp_flags = Py_TPFLAGS_DEFAULT,
-    .tp_doc = "Thread-local dummy",
-    .tp_weaklistoffset = offsetof(localdummyobject, weakreflist),
+static PyMemberDef local_dummy_type_members[] = {
+    {"__weaklistoffset__", T_PYSSIZET, offsetof(localdummyobject, weakreflist), READONLY},
+    {NULL},
+};
+
+static PyType_Slot local_dummy_type_slots[] = {
+    {Py_tp_dealloc, (destructor)localdummy_dealloc},
+    {Py_tp_doc, "Thread-local dummy"},
+    {Py_tp_members, local_dummy_type_members},
+    {0, 0}
+};
+
+static PyType_Spec local_dummy_type_spec = {
+    .name = "_thread._localdummy",
+    .basicsize = sizeof(localdummyobject),
+    .flags = (Py_TPFLAGS_DEFAULT | Py_TPFLAGS_DISALLOW_INSTANTIATION |
+              Py_TPFLAGS_IMMUTABLETYPE),
+    .slots = local_dummy_type_slots,
 };
 
 
@@ -632,16 +710,17 @@ typedef struct {
 } localobject;
 
 /* Forward declaration */
-static PyObject *_ldict(localobject *self);
+static PyObject *_ldict(localobject *self, thread_module_state *state);
 static PyObject *_localdummy_destroyed(PyObject *meth_self, PyObject *dummyweakref);
 
 /* Create and register the dummy for the current thread.
    Returns a borrowed reference of the corresponding local dict */
 static PyObject *
-_local_create_dummy(localobject *self)
+_local_create_dummy(localobject *self, thread_module_state *state)
 {
     PyObject *ldict = NULL, *wr = NULL;
     localdummyobject *dummy = NULL;
+    PyTypeObject *type = state->local_dummy_type;
 
     PyObject *tdict = PyThreadState_GetDict();
     if (tdict == NULL) {
@@ -654,7 +733,7 @@ _local_create_dummy(localobject *self)
     if (ldict == NULL) {
         goto err;
     }
-    dummy = (localdummyobject *) localdummytype.tp_alloc(&localdummytype, 0);
+    dummy = (localdummyobject *) type->tp_alloc(type, 0);
     if (dummy == NULL) {
         goto err;
     }
@@ -690,7 +769,6 @@ err:
 static PyObject *
 local_new(PyTypeObject *type, PyObject *args, PyObject *kw)
 {
-    localobject *self;
     static PyMethodDef wr_callback_def = {
         "_localdummy_destroyed", (PyCFunction) _localdummy_destroyed, METH_O
     };
@@ -710,7 +788,10 @@ local_new(PyTypeObject *type, PyObject *args, PyObject *kw)
         }
     }
 
-    self = (localobject *)type->tp_alloc(type, 0);
+    PyObject *module = PyType_GetModuleByDef(type, &thread_module);
+    thread_module_state *state = get_thread_state(module);
+
+    localobject *self = (localobject *)type->tp_alloc(type, 0);
     if (self == NULL) {
         return NULL;
     }
@@ -738,7 +819,7 @@ local_new(PyTypeObject *type, PyObject *args, PyObject *kw)
     if (self->wr_callback == NULL) {
         goto err;
     }
-    if (_local_create_dummy(self) == NULL) {
+    if (_local_create_dummy(self, state) == NULL) {
         goto err;
     }
     return (PyObject *)self;
@@ -751,6 +832,7 @@ local_new(PyTypeObject *type, PyObject *args, PyObject *kw)
 static int
 local_traverse(localobject *self, visitproc visit, void *arg)
 {
+    Py_VISIT(Py_TYPE(self));
     Py_VISIT(self->args);
     Py_VISIT(self->kw);
     Py_VISIT(self->dummies);
@@ -760,27 +842,26 @@ local_traverse(localobject *self, visitproc visit, void *arg)
 static int
 local_clear(localobject *self)
 {
-    PyThreadState *tstate;
     Py_CLEAR(self->args);
     Py_CLEAR(self->kw);
     Py_CLEAR(self->dummies);
     Py_CLEAR(self->wr_callback);
     /* Remove all strong references to dummies from the thread states */
-    if (self->key
-        && (tstate = PyThreadState_Get())
-        && tstate->interp) {
-        for(tstate = PyInterpreterState_ThreadHead(tstate->interp);
-            tstate;
-            tstate = PyThreadState_Next(tstate))
-            if (tstate->dict) {
-                PyObject *v = _PyDict_Pop(tstate->dict, self->key, Py_None);
-                if (v == NULL) {
-                    PyErr_Clear();
-                }
-                else {
-                    Py_DECREF(v);
-                }
+    if (self->key) {
+        PyInterpreterState *interp = _PyInterpreterState_GET();
+        PyThreadState *tstate = PyInterpreterState_ThreadHead(interp);
+        for(; tstate; tstate = PyThreadState_Next(tstate)) {
+            if (tstate->dict == NULL) {
+                continue;
             }
+            PyObject *v = _PyDict_Pop(tstate->dict, self->key, Py_None);
+            if (v != NULL) {
+                Py_DECREF(v);
+            }
+            else {
+                PyErr_Clear();
+            }
+        }
     }
     return 0;
 }
@@ -798,12 +879,15 @@ local_dealloc(localobject *self)
 
     local_clear(self);
     Py_XDECREF(self->key);
-    Py_TYPE(self)->tp_free((PyObject*)self);
+
+    PyTypeObject *tp = Py_TYPE(self);
+    tp->tp_free((PyObject*)self);
+    Py_DECREF(tp);
 }
 
 /* Returns a borrowed reference to the local dict, creating it if necessary */
 static PyObject *
-_ldict(localobject *self)
+_ldict(localobject *self, thread_module_state *state)
 {
     PyObject *tdict = PyThreadState_GetDict();
     if (tdict == NULL) {
@@ -818,7 +902,7 @@ _ldict(localobject *self)
         if (PyErr_Occurred()) {
             return NULL;
         }
-        ldict = _local_create_dummy(self);
+        ldict = _local_create_dummy(self, state);
         if (ldict == NULL)
             return NULL;
 
@@ -833,7 +917,7 @@ _ldict(localobject *self)
         }
     }
     else {
-        assert(Py_IS_TYPE(dummy, &localdummytype));
+        assert(Py_IS_TYPE(dummy, state->local_dummy_type));
         ldict = ((localdummyobject *) dummy)->localdict;
     }
 
@@ -843,17 +927,15 @@ _ldict(localobject *self)
 static int
 local_setattro(localobject *self, PyObject *name, PyObject *v)
 {
-    PyObject *ldict = _ldict(self);
+    PyObject *module = PyType_GetModuleByDef(Py_TYPE(self), &thread_module);
+    thread_module_state *state = get_thread_state(module);
+
+    PyObject *ldict = _ldict(self, state);
     if (ldict == NULL) {
         return -1;
     }
 
-    PyObject *str_dict = _PyUnicode_FromId(&PyId___dict__);  // borrowed ref
-    if (str_dict == NULL) {
-        return -1;
-    }
-
-    int r = PyObject_RichCompareBool(name, str_dict, Py_EQ);
+    int r = PyObject_RichCompareBool(name, &_Py_ID(__dict__), Py_EQ);
     if (r == -1) {
         return -1;
     }
@@ -869,34 +951,42 @@ local_setattro(localobject *self, PyObject *name, PyObject *v)
 
 static PyObject *local_getattro(localobject *, PyObject *);
 
-static PyTypeObject localtype = {
-    PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "_thread._local",
-    .tp_basicsize = sizeof(localobject),
-    .tp_dealloc = (destructor)local_dealloc,
-    .tp_getattro = (getattrofunc)local_getattro,
-    .tp_setattro = (setattrofunc)local_setattro,
-    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_GC,
-    .tp_doc = "Thread-local data",
-    .tp_traverse = (traverseproc)local_traverse,
-    .tp_clear = (inquiry)local_clear,
-    .tp_weaklistoffset = offsetof(localobject, weakreflist),
-    .tp_new = local_new,
+static PyMemberDef local_type_members[] = {
+    {"__weaklistoffset__", T_PYSSIZET, offsetof(localobject, weakreflist), READONLY},
+    {NULL},
+};
+
+static PyType_Slot local_type_slots[] = {
+    {Py_tp_dealloc, (destructor)local_dealloc},
+    {Py_tp_getattro, (getattrofunc)local_getattro},
+    {Py_tp_setattro, (setattrofunc)local_setattro},
+    {Py_tp_doc, "Thread-local data"},
+    {Py_tp_traverse, (traverseproc)local_traverse},
+    {Py_tp_clear, (inquiry)local_clear},
+    {Py_tp_new, local_new},
+    {Py_tp_members, local_type_members},
+    {0, 0}
+};
+
+static PyType_Spec local_type_spec = {
+    .name = "_thread._local",
+    .basicsize = sizeof(localobject),
+    .flags = (Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_GC |
+              Py_TPFLAGS_IMMUTABLETYPE),
+    .slots = local_type_slots,
 };
 
 static PyObject *
 local_getattro(localobject *self, PyObject *name)
 {
-    PyObject *ldict = _ldict(self);
+    PyObject *module = PyType_GetModuleByDef(Py_TYPE(self), &thread_module);
+    thread_module_state *state = get_thread_state(module);
+
+    PyObject *ldict = _ldict(self, state);
     if (ldict == NULL)
         return NULL;
 
-    PyObject *str_dict = _PyUnicode_FromId(&PyId___dict__);  // borrowed ref
-    if (str_dict == NULL) {
-        return NULL;
-    }
-
-    int r = PyObject_RichCompareBool(name, str_dict, Py_EQ);
+    int r = PyObject_RichCompareBool(name, &_Py_ID(__dict__), Py_EQ);
     if (r == 1) {
         return Py_NewRef(ldict);
     }
@@ -904,7 +994,7 @@ local_getattro(localobject *self, PyObject *name)
         return NULL;
     }
 
-    if (!Py_IS_TYPE(self, &localtype)) {
+    if (!Py_IS_TYPE(self, state->local_type)) {
         /* use generic lookup for subtypes */
         return _PyObject_GenericGetAttrWithDict((PyObject *)self, name,
                                                 ldict, 0);
@@ -980,9 +1070,14 @@ thread_run(void *boot_raw)
 
     tstate = boot->tstate;
     tstate->thread_id = PyThread_get_thread_ident();
-    _PyThreadState_Init(tstate);
+#ifdef PY_HAVE_THREAD_NATIVE_ID
+    tstate->native_thread_id = PyThread_get_thread_native_id();
+#else
+    tstate->native_thread_id = 0;
+#endif
+    _PyThreadState_SetCurrent(tstate);
     PyEval_AcquireThread(tstate);
-    tstate->interp->num_threads++;
+    tstate->interp->threads.count++;
 
     PyObject *res = PyObject_Call(boot->func, boot->args, boot->kwargs);
     if (res == NULL) {
@@ -998,11 +1093,13 @@ thread_run(void *boot_raw)
     }
 
     thread_bootstate_free(boot);
-    tstate->interp->num_threads--;
+    tstate->interp->threads.count--;
     PyThreadState_Clear(tstate);
     _PyThreadState_DeleteCurrent(tstate);
 
-    PyThread_exit_thread();
+    // bpo-44434: Don't call explicitly PyThread_exit_thread(). On Linux with
+    // the glibc, pthread_exit() can abort the whole process if dlopen() fails
+    // to open the libgcc_s.so library (ex: EMFILE error).
 }
 
 static PyObject *
@@ -1088,25 +1185,37 @@ This is synonymous to ``raise SystemExit''.  It will cause the current\n\
 thread to exit silently unless the exception is caught.");
 
 static PyObject *
-thread_PyThread_interrupt_main(PyObject * self, PyObject *Py_UNUSED(ignored))
+thread_PyThread_interrupt_main(PyObject *self, PyObject *args)
 {
-    PyErr_SetInterrupt();
+    int signum = SIGINT;
+    if (!PyArg_ParseTuple(args, "|i:signum", &signum)) {
+        return NULL;
+    }
+
+    if (PyErr_SetInterruptEx(signum)) {
+        PyErr_SetString(PyExc_ValueError, "signal number out of range");
+        return NULL;
+    }
     Py_RETURN_NONE;
 }
 
 PyDoc_STRVAR(interrupt_doc,
-"interrupt_main()\n\
+"interrupt_main(signum=signal.SIGINT, /)\n\
 \n\
-Raise a KeyboardInterrupt in the main thread.\n\
-A subthread can use this function to interrupt the main thread."
+Simulate the arrival of the given signal in the main thread,\n\
+where the corresponding signal handler will be executed.\n\
+If *signum* is omitted, SIGINT is assumed.\n\
+A subthread can use this function to interrupt the main thread.\n\
+\n\
+Note: the default signal handler for SIGINT raises ``KeyboardInterrupt``."
 );
 
-static lockobject *newlockobject(void);
+static lockobject *newlockobject(PyObject *module);
 
 static PyObject *
 thread_PyThread_allocate_lock(PyObject *module, PyObject *Py_UNUSED(ignored))
 {
-    return (PyObject *) newlockobject();
+    return (PyObject *) newlockobject(module);
 }
 
 PyDoc_STRVAR(allocate_doc,
@@ -1158,7 +1267,7 @@ static PyObject *
 thread__count(PyObject *self, PyObject *Py_UNUSED(ignored))
 {
     PyInterpreterState *interp = _PyInterpreterState_GET();
-    return PyLong_FromLong(interp->num_threads);
+    return PyLong_FromLong(interp->threads.count);
 }
 
 PyDoc_STRVAR(_count_doc,
@@ -1198,7 +1307,7 @@ static PyObject *
 thread__set_sentinel(PyObject *module, PyObject *Py_UNUSED(ignored))
 {
     PyObject *wr;
-    PyThreadState *tstate = PyThreadState_Get();
+    PyThreadState *tstate = _PyThreadState_GET();
     lockobject *lock;
 
     if (tstate->on_delete_data != NULL) {
@@ -1210,7 +1319,7 @@ thread__set_sentinel(PyObject *module, PyObject *Py_UNUSED(ignored))
         tstate->on_delete_data = NULL;
         Py_DECREF(wr);
     }
-    lock = newlockobject();
+    lock = newlockobject(module);
     if (lock == NULL)
         return NULL;
     /* The lock is owned by whoever called _set_sentinel(), but the weakref
@@ -1291,7 +1400,6 @@ static int
 thread_excepthook_file(PyObject *file, PyObject *exc_type, PyObject *exc_value,
                        PyObject *exc_traceback, PyObject *thread)
 {
-    _Py_IDENTIFIER(name);
     /* print(f"Exception in thread {thread.name}:", file=file) */
     if (PyFile_WriteString("Exception in thread ", file) < 0) {
         return -1;
@@ -1299,7 +1407,7 @@ thread_excepthook_file(PyObject *file, PyObject *exc_type, PyObject *exc_value,
 
     PyObject *name = NULL;
     if (thread != Py_None) {
-        if (_PyObject_LookupAttrId(thread, &PyId_name, &name) < 0) {
+        if (_PyObject_LookupAttr(thread, &_Py_ID(name), &name) < 0) {
             return -1;
         }
     }
@@ -1337,7 +1445,7 @@ thread_excepthook_file(PyObject *file, PyObject *exc_type, PyObject *exc_value,
     _PyErr_Display(file, exc_type, exc_value, exc_traceback);
 
     /* Call file.flush() */
-    PyObject *res = _PyObject_CallMethodIdNoArgs(file, &PyId_flush);
+    PyObject *res = PyObject_CallMethodNoArgs(file, &_Py_ID(flush));
     if (!res) {
         return -1;
     }
@@ -1351,8 +1459,6 @@ PyDoc_STRVAR(ExceptHookArgs__doc__,
 "ExceptHookArgs\n\
 \n\
 Type used to pass arguments to threading.excepthook.");
-
-static PyTypeObject ExceptHookArgsType;
 
 static PyStructSequence_Field ExceptHookArgs_fields[] = {
     {"exc_type", "Exception type"},
@@ -1371,9 +1477,11 @@ static PyStructSequence_Desc ExceptHookArgs_desc = {
 
 
 static PyObject *
-thread_excepthook(PyObject *self, PyObject *args)
+thread_excepthook(PyObject *module, PyObject *args)
 {
-    if (!Py_IS_TYPE(args, &ExceptHookArgsType)) {
+    thread_module_state *state = get_thread_state(module);
+
+    if (!Py_IS_TYPE(args, state->excepthook_type)) {
         PyErr_SetString(PyExc_TypeError,
                         "_thread.excepthook argument type "
                         "must be ExceptHookArgs");
@@ -1392,7 +1500,8 @@ thread_excepthook(PyObject *self, PyObject *args)
     PyObject *exc_tb = PyStructSequence_GET_ITEM(args, 2);
     PyObject *thread = PyStructSequence_GET_ITEM(args, 3);
 
-    PyObject *file = _PySys_GetObjectId(&PyId_stderr);
+    PyThreadState *tstate = _PyThreadState_GET();
+    PyObject *file = _PySys_GetAttr(tstate, &_Py_ID(stderr));
     if (file == NULL || file == Py_None) {
         if (thread == Py_None) {
             /* do nothing if sys.stderr is None and thread is None */
@@ -1442,8 +1551,8 @@ static PyMethodDef thread_methods[] = {
      METH_NOARGS, exit_doc},
     {"exit",                    thread_PyThread_exit_thread,
      METH_NOARGS, exit_doc},
-    {"interrupt_main",          thread_PyThread_interrupt_main,
-     METH_NOARGS, interrupt_doc},
+    {"interrupt_main",          (PyCFunction)thread_PyThread_interrupt_main,
+     METH_VARARGS, interrupt_doc},
     {"get_ident",               thread_get_ident,
      METH_NOARGS, get_ident_doc},
 #ifdef PY_HAVE_THREAD_NATIVE_ID
@@ -1465,50 +1574,65 @@ static PyMethodDef thread_methods[] = {
 /* Initialization function */
 
 static int
-_thread_module_exec(PyObject *module)
+thread_module_exec(PyObject *module)
 {
+    thread_module_state *state = get_thread_state(module);
+    PyObject *d = PyModule_GetDict(module);
+
     // Initialize the C thread library
     PyThread_init_thread();
 
-    // Initialize types
-    if (PyType_Ready(&localdummytype) < 0)
-        return -1;
-    if (PyType_Ready(&localtype) < 0) {
-        return -1;
-    }
-    if (PyType_Ready(&Locktype) < 0) {
+    // Lock
+    state->lock_type = (PyTypeObject *)PyType_FromSpec(&lock_type_spec);
+    if (state->lock_type == NULL) {
         return -1;
     }
-    if (PyType_Ready(&RLocktype) < 0) {
+    if (PyDict_SetItemString(d, "LockType", (PyObject *)state->lock_type) < 0) {
         return -1;
     }
-    if (ExceptHookArgsType.tp_name == NULL) {
-        if (PyStructSequence_InitType2(&ExceptHookArgsType,
-                                       &ExceptHookArgs_desc) < 0) {
-            return -1;
-        }
+
+    // RLock
+    PyTypeObject *rlock_type = (PyTypeObject *)PyType_FromSpec(&rlock_type_spec);
+    if (rlock_type == NULL) {
+        return -1;
+    }
+    if (PyModule_AddType(module, rlock_type) < 0) {
+        Py_DECREF(rlock_type);
+        return -1;
+    }
+    Py_DECREF(rlock_type);
+
+    // Local dummy
+    state->local_dummy_type = (PyTypeObject *)PyType_FromSpec(&local_dummy_type_spec);
+    if (state->local_dummy_type == NULL) {
+        return -1;
+    }
+
+    // Local
+    state->local_type = (PyTypeObject *)PyType_FromModuleAndSpec(module, &local_type_spec, NULL);
+    if (state->local_type == NULL) {
+        return -1;
+    }
+    if (PyModule_AddType(module, state->local_type) < 0) {
+        return -1;
     }
 
     // Add module attributes
-    PyObject *d = PyModule_GetDict(module);
     if (PyDict_SetItemString(d, "error", ThreadError) < 0) {
         return -1;
     }
-    if (PyDict_SetItemString(d, "LockType", (PyObject *)&Locktype) < 0) {
+
+    // _ExceptHookArgs type
+    state->excepthook_type = PyStructSequence_NewType(&ExceptHookArgs_desc);
+    if (state->excepthook_type == NULL) {
         return -1;
     }
-    if (PyModule_AddType(module, &RLocktype) < 0) {
-        return -1;
-    }
-    if (PyModule_AddType(module, &localtype) < 0) {
-        return -1;
-    }
-    if (PyModule_AddType(module, &ExceptHookArgsType) < 0) {
+    if (PyModule_AddType(module, state->excepthook_type) < 0) {
         return -1;
     }
 
     // TIMEOUT_MAX
-    double timeout_max = (_PyTime_t)PY_TIMEOUT_MAX * 1e-6;
+    double timeout_max = (double)PY_TIMEOUT_MAX * 1e-6;
     double time_max = _PyTime_AsSecondsDouble(_PyTime_MAX);
     timeout_max = Py_MIN(timeout_max, time_max);
     // Round towards minus infinity
@@ -1523,28 +1647,59 @@ _thread_module_exec(PyObject *module)
 }
 
 
+static int
+thread_module_traverse(PyObject *module, visitproc visit, void *arg)
+{
+    thread_module_state *state = get_thread_state(module);
+    Py_VISIT(state->excepthook_type);
+    Py_VISIT(state->lock_type);
+    Py_VISIT(state->local_type);
+    Py_VISIT(state->local_dummy_type);
+    return 0;
+}
+
+static int
+thread_module_clear(PyObject *module)
+{
+    thread_module_state *state = get_thread_state(module);
+    Py_CLEAR(state->excepthook_type);
+    Py_CLEAR(state->lock_type);
+    Py_CLEAR(state->local_type);
+    Py_CLEAR(state->local_dummy_type);
+    return 0;
+}
+
+static void
+thread_module_free(void *module)
+{
+    thread_module_clear((PyObject *)module);
+}
+
+
+
 PyDoc_STRVAR(thread_doc,
 "This module provides primitive operations to write multi-threaded programs.\n\
 The 'threading' module provides a more convenient interface.");
 
-static struct PyModuleDef _thread_module = {
+static PyModuleDef_Slot thread_module_slots[] = {
+    {Py_mod_exec, thread_module_exec},
+    {0, NULL}
+};
+
+static struct PyModuleDef thread_module = {
     PyModuleDef_HEAD_INIT,
     .m_name = "_thread",
     .m_doc = thread_doc,
-    .m_size = -1,
+    .m_size = sizeof(thread_module_state),
     .m_methods = thread_methods,
+    .m_traverse = thread_module_traverse,
+    .m_clear = thread_module_clear,
+    .m_free = thread_module_free,
+    .m_slots = thread_module_slots,
 };
 
 PyMODINIT_FUNC
 PyInit__thread(void)
 {
-    PyObject *module = PyModule_Create(&_thread_module);
-    if (module == NULL)
-        return NULL;
-
-    if (_thread_module_exec(module) < 0) {
-        Py_DECREF(module);
-        return NULL;
-    }
-    return module;
+    return PyModuleDef_Init(&thread_module);
 }
