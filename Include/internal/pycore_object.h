@@ -341,7 +341,8 @@ _PyType_PreHeaderSize(PyTypeObject *tp)
     size_t base = _PyType_IS_GC(tp) * sizeof(PyGC_Head) +
         _PyType_HasFeature(tp, Py_TPFLAGS_PREHEADER) * 2 * sizeof(PyObject *);
     if (tp->tp_cache != NULL)
-	    base += *((size_t*)(&((PyVarObject*)tp_cache)[1]));
+	    /* managed size is the size_t after the PyVarObject in the tp_cache slot. */
+	    base += *((size_t*)(&((PyVarObject*)(tp->tp_cache))[1]));
     return base;
 }
 

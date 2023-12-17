@@ -4267,6 +4267,7 @@ _PyType_FromMetaclass_impl(
 
     /* Calculate sizes */
 
+    Py_ssize_t extsize = 0;
     Py_ssize_t basicsize = spec->basicsize;
     Py_ssize_t type_data_offset = spec->basicsize;
     if (basicsize == 0) {
@@ -4274,6 +4275,11 @@ _PyType_FromMetaclass_impl(
         basicsize = base->tp_basicsize;
     }
     else if (basicsize < 0) {
+	extsize = - basicsize;
+        basicsize = type_data_offset;
+#if 0
+	/* FIXME determine how to combine the two extension methods */
+
         /* Extend */
         type_data_offset = _align_up(base->tp_basicsize);
         basicsize = type_data_offset + _align_up(-spec->basicsize);
@@ -4287,6 +4293,7 @@ _PyType_FromMetaclass_impl(
                 "Cannot extend variable-size class without Py_TPFLAGS_ITEMS_AT_END.");
             goto finally;
         }
+#endif
     }
 
     Py_ssize_t itemsize = spec->itemsize;
@@ -4408,6 +4415,9 @@ _PyType_FromMetaclass_impl(
     if (PyType_Ready(type) < 0) {
         goto finally;
     }
+
+    /* Set up layout for memory */
+//    type->tp_cache = _PyLayout_Create(type, type->tp_mro, extsize);
 
     if (!check_basicsize_includes_size_and_offsets(type)) {
         goto finally;

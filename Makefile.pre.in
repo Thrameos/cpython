@@ -480,6 +480,7 @@ OBJECT_OBJS=	\
 		Objects/structseq.o \
 		Objects/tupleobject.o \
 		Objects/typeobject.o \
+		Objects/layoutobject.o \
 		Objects/typevarobject.o \
 		Objects/unicodeobject.o \
 		Objects/unicodectype.o \
