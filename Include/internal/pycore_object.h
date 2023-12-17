@@ -338,8 +338,11 @@ _PyObject_IS_GC(PyObject *obj)
 static inline size_t
 _PyType_PreHeaderSize(PyTypeObject *tp)
 {
-    return _PyType_IS_GC(tp) * sizeof(PyGC_Head) +
+    size_t base = _PyType_IS_GC(tp) * sizeof(PyGC_Head) +
         _PyType_HasFeature(tp, Py_TPFLAGS_PREHEADER) * 2 * sizeof(PyObject *);
+    if (tp->tp_cache != NULL)
+	    base += *((size_t*)(&((PyVarObject*)tp_cache)[1]));
+    return base;
 }
 
 void _PyObject_GC_Link(PyObject *op);

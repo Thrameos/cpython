@@ -2,7 +2,7 @@
  *
  * Managed memory is an opaque memory structure that can be accessed
  * by for a class.   To create managed memory the class must use a
- * negative basesize when declaring itself.  The memory will be added
+ * negative basicsize when declaring itself.  The memory will be added
  * to the object when it is alllocated.
  *
  * Multiple inheritance with opaque data is always pure virtual.
@@ -10,7 +10,7 @@
  * respect to the base address of the object.  The offset may change
  * whenever the type is derived.
  *
- * Acces to opaque memory in which there is no multiple inheritance is
+ * Access to opaque memory in which there is no multiple inheritance is
  * guaranteed to be O(1).   Access with multiple inheritance will make
  * best effort for fast operations.
  *
@@ -19,6 +19,43 @@
  *
  * This implementation is currently using the tp_cache slot for
  * fast access.
+ *
+ * ---------------------------------------------------
+ *
+ *  Rational for implementation:
+ *
+ *  Why use managed memory?
+ *
+ *    Single inheritance makes it difficult to implement language bindings
+ *    in which foriegn data must be associated with a derived class.
+ *    Having a direct lookup of class associated data the does not
+ *    interfer with the layout of the object is preferable.
+ *
+ *    This will not solve the issue of inheriting from multiple conflicting
+ *    base classes in the case of some feature that is not fixed
+ *    size class data (such as inheriting from PyUnicode and PyLong),
+ *    but it will allow greater flexiblity in object structure.
+ *
+ *    The secondary benefit is that the opaque data structures are 
+ *    private and allow greater flexibility behind the scenes by allowing
+ *    C implemented classes to hide their details.   An inheriting class
+ *    does not need to know the structure of the opaque data.
+ *
+ *  Why must the exact type be used rather than a derived type when
+ *  retrieving the class data?
+ *
+ *    If the programmer assumes that the derived type can access the 
+ *    data rather than the declaring class, then any changes to class
+ *    heirarchy that introduce a new opaque data type in between 
+ *    would result in getting the data for the new type rather than expected.
+ *
+ *    The cost of this is that the programmer must know the name of the type
+ *    being requested.   Asking for PyObject_Cast(obj, Py_TYPE(obj)) is not
+ *    guaranteed to give any class data becaus the object may be of a derived
+ *    type.
+ *
+ *    This also has consequences if slot data is stored in the opaque data
+ *    as the original declaring type must be used to retrieve the data. 
  */
 #include "Python.h"
 
@@ -43,8 +80,8 @@ struct _layout_entry {
 
 struct _layout {
 	PyVarObject ob_base;
-	Py_ssize_t ly_allocsize;  /* The size to pass to the allocator.  Must be the first entry. */
-	Py_ssize_t ly_basesize; /* The size of the memory to be added to object for this particular layout */
+	size_t ly_allocsize;  /* The size to pass to the allocator.  Must be the first entry. */
+	Py_ssize_t ly_extensionsize; /* The size of the memory to be added to object for this particular layout */
 
 	/* Slot the determines how to perform a cast. Other slots may be added to improve lookup capabilities. */
 	_layoutfunc ly_cast;
@@ -291,7 +328,7 @@ _layout_fill_ordered(PyLayout* layout, PyTypeObject* type, PyObject* layouts)
 	while (PyDict_Next(layouts, &pos, &key, &value)) {
 		PyLayout* sub_layout = (PyLayout*) value;
 		uint32_t position = sub_layout->ly_order;
-		offset += _align_up(sub_layout->ly_basesize);
+		offset += _align_up(sub_layout->ly_extensionsize);
 		entries[position].le_type = key;
 		entries[position].le_offset = -base - offset;
 	}
@@ -328,7 +365,7 @@ _layout_fill_hash(PyLayout* layout, PyTypeObject* type, PyObject* layouts)
 		if (layout->ly_search<cost)
 			layout->ly_search = cost;
 
-		offset += _align_up(sub_layout->ly_basesize);
+		offset += _align_up(sub_layout->ly_extensionsize);
 		entries[position].le_type = key;
 		entries[position].le_offset = -base-offset;
 	}
@@ -395,7 +432,7 @@ _PyLayout_Create(PyTypeObject* type, PyObject* bases, Py_ssize_t size)
 	/* Fill out fields */
 	result->ly_id = id;
 	result->ly_order = order;
-	result->ly_basesize = size;
+	result->ly_extensionsize = size;
 	result->ly_allocsize = 0; /* this will be created by the fill operation */
 	result->ly_search = 1; /* this will be created by the fill operation */
 
