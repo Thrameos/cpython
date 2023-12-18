@@ -588,6 +588,3 @@ PyAPI_FUNC(void*) PyObject_Cast(PyObject *obj, PyTypeObject* type);
 
 /* (internal) Function called by type to allocate a new layout for an object. */
 PyAPI_FUNC(PyObject *) _PyLayout_Create(PyTypeObject *, PyObject *, Py_ssize_t);
-
-/* (internal) Called once to allocate the layout type. */
-PyAPI_FUNC(void) _PyLayout_Initialize(void);

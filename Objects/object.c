@@ -2021,6 +2021,7 @@ extern PyTypeObject _PyMemoryIter_Type;
 extern PyTypeObject _PyLineIterator;
 extern PyTypeObject _PyPositionsIterator;
 extern PyTypeObject _PyLegacyEventHandler_Type;
+extern PyTypeObject _PyLayout_Type;
 
 static PyTypeObject* static_types[] = {
     // The two most important base types: must be initialized first and
@@ -2132,6 +2133,7 @@ static PyTypeObject* static_types[] = {
     &_PyWeakref_ProxyType,
     &_PyWeakref_RefType,
     &_PyTypeAlias_Type,
+    &_PyLayout_Type,
 
     // subclasses: _PyTypes_FiniTypes() deallocates them before their base
     // class

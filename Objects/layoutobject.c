@@ -72,6 +72,8 @@ typedef struct _layout_entry PyLayoutEntry;
 /* function that takes an object and products a memory address */
 typedef void *(*_layoutfunc)(PyLayout*, PyObject *, PyObject *);
 
+extern PyTypeObject _PyLayout_Type;
+
 struct _layout_entry {
 	PyObject* le_type; /* this is a borrowed reference as it is used only for identification of the type */
 	int32_t le_offset;    /* this should be negative value describing how far back to go. */
@@ -93,7 +95,6 @@ struct _layout {
 	uint32_t ly_search; /* Number of hash elements the need to be searched before a miss can be declared. */
 };
 
-static PyTypeObject* PyLayoutType;
 
 
 void*
@@ -417,14 +418,14 @@ _PyLayout_Create(PyTypeObject* type, PyObject* bases, Py_ssize_t size)
 
 	if ( _layout_check_ordered(layouts))
 	{
-		result = (PyLayout*) PyObject_NewVar(PyLayout, PyLayoutType, entries);
+		result = (PyLayout*) PyObject_NewVar(PyLayout, &_PyLayout_Type, entries);
 		result->ly_cast = _layout_cast_ordered;
 		result->ly_shift = 0;
 	}
 	else
 	{
 		entries *= 2;
-		result = (PyLayout*) PyObject_NewVar(PyLayout, PyLayoutType, entries);
+		result = (PyLayout*) PyObject_NewVar(PyLayout, &_PyLayout_Type, entries);
 		result->ly_cast = _layout_cast_hash;
 		result->ly_shift = _layout_fast_hash(layouts, entries, id);
 	}
@@ -437,7 +438,7 @@ _PyLayout_Create(PyTypeObject* type, PyObject* bases, Py_ssize_t size)
 	result->ly_search = 1; /* this will be created by the fill operation */
 
 	_layout_clear(result);
-	PyObject_InitVar((PyVarObject*)result, (PyTypeObject*) PyLayoutType, entries);
+	PyObject_InitVar((PyVarObject*)result, (PyTypeObject*) &_PyLayout_Type, entries);
 
 	/* Add our new layout to the memory allocation. */
 	if (size>0)
@@ -458,26 +459,15 @@ _PyLayout_Create(PyTypeObject* type, PyObject* bases, Py_ssize_t size)
 	return (PyObject*) result;
 }
 
-static PyType_Slot _layout_slots[] = {
-	{0}
+PyTypeObject _PyLayout_Type = {
+    PyVarObject_HEAD_INIT(&PyType_Type, 0)
+    .tp_name = "layout",
+    .tp_basicsize = sizeof(PyLayout),
+    .tp_itemsize = sizeof(PyLayoutEntry),
+    // methods
+    .tp_getattro = PyObject_GenericGetAttr,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
 };
-
-/** Layouts are currently opaque objects */
-static PyType_Spec _layout_spec = {
-	"layout",
-	sizeof(PyLayout),
-	sizeof(PyLayoutEntry),
-	Py_TPFLAGS_DEFAULT,
-	_layout_slots
-};
-
-/**
- * This is called once at the appropriate time to allocate the layout support.
- */
-void _PyLayout_Initialize(void)
-{
-	PyLayoutType = (PyTypeObject*) PyType_FromSpec(&_layout_spec);
-}
 
 #ifdef __cplusplus
 }
