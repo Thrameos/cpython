@@ -156,8 +156,7 @@ _layout_cast_hash(PyLayout* layout, PyObject* obj, PyObject* type)
 
     requested >>= layout->ly_shift;
     requested %= nentries;
-    for (size_t i=0; i<layout->ly_search; ++i)
-    {
+    for (size_t i=0; i<layout->ly_search; ++i) {
         if (entries[requested].le_type == type)
             return &(bytes[entries[requested].le_offset]);
         requested++;
@@ -184,11 +183,9 @@ _layout_collect(PyObject* tuple)
         return NULL;
 
     int sz = PyTuple_Size(tuple);
-    for (int i = 0; i<sz; ++i)
-    {
+    for (int i = 0; i<sz; ++i) {
         PyTypeObject* type = (PyTypeObject*) PyTuple_GetItem(tuple, i); /* borrowed */
-        if (Py_LAYOUT(type) != NULL)
-        {
+        if (Py_LAYOUT(type) != NULL) {
             PyDict_SetItem(dict, (PyObject*) type, (PyObject*) Py_LAYOUT(type));
         }
     }
@@ -212,8 +209,7 @@ _layout_check_ordered(PyObject* layouts)
     while (PyDict_Next(layouts, &pos, &key, &value)) {
         PyLayout* layout = (PyLayout*) value;
         uint32_t order = layout->ly_order;
-        if (order >= items || buf[order]>0)
-        {
+        if (order >= items || buf[order]>0) {
             is_ordered = 0;
             break;
         }
@@ -252,8 +248,7 @@ _layout_fast_hash(PyObject* layouts, Py_ssize_t hash_size, uint32_t id)
             PyLayout* layout = (PyLayout*) value;
             position = ((layout->ly_id)>> shift) % hash_size;
             int cost0 = 1;
-            while (buf[position] >0)
-            {
+            while (buf[position] >0) {
                 cost0++;
                 position++;
                 if (position == hash_size)
@@ -264,15 +259,13 @@ _layout_fast_hash(PyObject* layouts, Py_ssize_t hash_size, uint32_t id)
         }
 
         /* We found a perfect hash no need to continue. */
-        if (cost == items)
-        {
+        if (cost == items) {
             best = shift;
             break;
         }
 
         /* Else try again. */
-        if (cost<best_cost)
-        {
+        if (cost<best_cost) {
             best_cost = cost;
             best = shift;
         }
@@ -350,8 +343,7 @@ _layout_fill_hash(PyLayout* layout, PyTypeObject* type, PyObject* layouts)
         /* Build the hash table */
          uint32_t position = ((sub_layout->ly_id)>> shift) % hash_size;
         uint32_t cost = 1;
-        while (entries[position].le_type !=NULL)
-        {
+        while (entries[position].le_type !=NULL) {
             cost++;
             position++;
             if (position==hash_size)
@@ -412,14 +404,12 @@ _PyLayout_Create(PyTypeObject* type, PyObject* bases, Py_ssize_t size)
     uint32_t id = rand();
     PyLayout* result;
 
-    if ( _layout_check_ordered(layouts))
-    {
+    if ( _layout_check_ordered(layouts)) {
         result = (PyLayout*) PyObject_NewVar(PyLayout, &_PyLayout_Type, entries);
         result->ly_cast = _layout_cast_ordered;
         result->ly_shift = 0;
     }
-    else
-    {
+    else {
         entries *= 2;
         result = (PyLayout*) PyObject_NewVar(PyLayout, &_PyLayout_Type, entries);
         result->ly_cast = _layout_cast_hash;
@@ -441,12 +431,10 @@ _PyLayout_Create(PyTypeObject* type, PyObject* bases, Py_ssize_t size)
         PyDict_SetItem(layouts, (PyObject*) type, (PyObject*) result);
 
     /* Fill the entries */
-    if (result->ly_cast == _layout_cast_ordered)
-    {
+    if (result->ly_cast == _layout_cast_ordered) {
         _layout_fill_ordered(result, type, layouts);
     }
-    else
-    {
+    else {
         _layout_fill_hash(result, type, layouts);
     }
 
