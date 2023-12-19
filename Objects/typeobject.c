@@ -4275,25 +4275,24 @@ _PyType_FromMetaclass_impl(
         basicsize = base->tp_basicsize;
     }
     else if (basicsize < 0) {
-	extsize = - basicsize;
-        basicsize = type_data_offset;
-#if 0
-	/* FIXME determine how to combine the two extension methods */
-
-        /* Extend */
-        type_data_offset = _align_up(base->tp_basicsize);
-        basicsize = type_data_offset + _align_up(-spec->basicsize);
-
-        /* Inheriting variable-sized types is limited */
-        if (base->tp_itemsize
-            && !((base->tp_flags | spec->flags) & Py_TPFLAGS_ITEMS_AT_END))
-        {
-            PyErr_SetString(
-                PyExc_SystemError,
-                "Cannot extend variable-size class without Py_TPFLAGS_ITEMS_AT_END.");
-            goto finally;
+        if ((spec->flags & Py_TPFLAGS_ITEMS_AT_END) == 0) {
+            extsize = _align_up(-basicsize);
+            basicsize = type_data_offset;
         }
-#endif
+        else {
+            /* Extend */
+            type_data_offset = _align_up(base->tp_basicsize);
+            basicsize = type_data_offset + _align_up(-spec->basicsize);
+
+            /* Inheriting variable-sized types is limited */
+            if (base->tp_itemsize
+                && !((base->tp_flags | spec->flags) & Py_TPFLAGS_ITEMS_AT_END)) {
+                PyErr_SetString(
+                    PyExc_SystemError,
+                    "Cannot extend variable-size class without Py_TPFLAGS_ITEMS_AT_END.");
+                goto finally;
+            }
+        }
     }
 
     Py_ssize_t itemsize = spec->itemsize;
@@ -4417,7 +4416,7 @@ _PyType_FromMetaclass_impl(
     }
 
     /* Set up layout for memory */
-//    type->tp_cache = _PyLayout_Create(type, type->tp_mro, extsize);
+    type->tp_cache = _PyLayout_Create(type, type->tp_mro, extsize);
 
     if (!check_basicsize_includes_size_and_offsets(type)) {
         goto finally;
@@ -4619,6 +4618,7 @@ PyType_GetModuleByDef(PyTypeObject *type, PyModuleDef *def)
     return NULL;
 }
 
+#if 0
 void *
 PyObject_GetTypeData(PyObject *obj, PyTypeObject *cls)
 {
@@ -4635,6 +4635,7 @@ PyType_GetTypeDataSize(PyTypeObject *cls)
     }
     return result;
 }
+#endif
 
 void *
 PyObject_GetItemData(PyObject *obj)

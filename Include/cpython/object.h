@@ -574,17 +574,5 @@ PyAPI_FUNC(int) PyType_Unwatch(int watcher_id, PyObject *type);
  */
 PyAPI_FUNC(int) PyUnstable_Type_AssignVersionTag(PyTypeObject *type);
 
-/* Access opaque data for a type.
- *
- * The object point must be to the base address of the object.
- * The type field must be the exact type that declared the opaque memory.
- * This function makes no NULL checks as the user must know that object
- * exists and the type request is valid.   The function will not
- * produce an exception.
- *
- * Returns the memory or NULL if the object lacks memory for that type.
- */
-PyAPI_FUNC(void*) PyObject_Cast(PyObject *obj, PyTypeObject* type);
-
 /* (internal) Function called by type to allocate a new layout for an object. */
 PyAPI_FUNC(PyObject *) _PyLayout_Create(PyTypeObject *, PyObject *, Py_ssize_t);
