@@ -36,7 +36,7 @@
  *    size class data (such as inheriting from PyUnicode and PyLong),
  *    but it will allow greater flexiblity in object structure.
  *
- *    The secondary benefit is that the opaque data structures are 
+ *    The secondary benefit is that the opaque data structures are
  *    private and allow greater flexibility behind the scenes by allowing
  *    C implemented classes to hide their details.   An inheriting class
  *    does not need to know the structure of the opaque data.
@@ -44,9 +44,9 @@
  *  Why must the exact type be used rather than a derived type when
  *  retrieving the class data?
  *
- *    If the programmer assumes that the derived type can access the 
+ *    If the programmer assumes that the derived type can access the
  *    data rather than the declaring class, then any changes to class
- *    heirarchy that introduce a new opaque data type in between 
+ *    heirarchy that introduce a new opaque data type in between
  *    would result in getting the data for the new type rather than expected.
  *
  *    The cost of this is that the programmer must know the name of the type
@@ -55,7 +55,7 @@
  *    type.
  *
  *    This also has consequences if slot data is stored in the opaque data
- *    as the original declaring type must be used to retrieve the data. 
+ *    as the original declaring type must be used to retrieve the data.
  */
 #include "Python.h"
 
@@ -329,7 +329,7 @@ _layout_fill_ordered(PyLayout* layout, PyTypeObject* type, PyObject* layouts)
     }
     /* Store the resulting size in the layout */
     layout->ly_allocsize = offset;
-}    
+}
 
 static void
 _layout_fill_hash(PyLayout* layout, PyTypeObject* type, PyObject* layouts)
