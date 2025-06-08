@@ -1,3 +1,4 @@
+/* --- file: Python/gc.c --- */
 //  This implements the reference cycle garbage collector.
 //  The Python module interface to the collector is in gcmodule.c.
 //  See https://devguide.python.org/internals/garbage-collector/
@@ -12,6 +13,7 @@
 #include "pycore_pystate.h"       // _PyThreadState_GET()
 #include "pycore_tuple.h"         // _PyTuple_MaybeUntrack()
 #include "pycore_weakref.h"       // _PyWeakref_ClearRef()
+#include "cpython/clgc.h"
 
 #include "pydtrace.h"
 
@@ -19,6 +21,7 @@
 #ifndef Py_GIL_DISABLED
 
 typedef struct _gc_runtime_state GCState;
+typedef struct _gc_manager_node GCManagerEntry;
 
 #ifdef Py_DEBUG
 #  define GC_DEBUG
@@ -150,6 +153,10 @@ get_gc_state(void)
     return &interp->gc;
 }
 
+static void gc_manager_broadcast(GCState *state, GCInfoPhase phase);
+static void gc_manager_marking(GCState *state);
+static void gc_manager_analysis(GCState *state);
+static void gc_manager_rescue(GCState *state, visitproc proc, void* args);
 
 void
 _PyGC_InitState(GCState *gcstate)
@@ -168,6 +175,10 @@ _PyGC_InitState(GCState *gcstate)
     INIT_HEAD(gcstate->old[1]);
     INIT_HEAD(gcstate->permanent_generation);
 
+    gcstate->manager_list.prev = &gcstate->manager_list;
+    gcstate->manager_list.next = &gcstate->manager_list;
+    gcstate->manager_list.manager = NULL;
+    gcstate->manager_list.resources = NULL;
 #undef INIT_HEAD
 }
 
@@ -665,7 +676,7 @@ visit_reachable(PyObject *op, void *arg)
  * So we can not gc_list_* functions for unreachable until we remove the flag.
  */
 static void
-move_unreachable(PyGC_Head *young, PyGC_Head *unreachable)
+move_unreachable(GCState* gcstate, PyGC_Head *young, PyGC_Head *unreachable)
 {
     // previous elem in the young list, used for restore gc_prev.
     PyGC_Head *prev = young;
@@ -683,58 +694,67 @@ move_unreachable(PyGC_Head *young, PyGC_Head *unreachable)
     validate_consistent_old_space(young);
     /* Record which old space we are in, and set NEXT_MASK_UNREACHABLE bit for convenience */
     uintptr_t flags = NEXT_MASK_UNREACHABLE | (gc->_gc_next & _PyGC_NEXT_MASK_OLD_SPACE_1);
-    while (gc != young) {
-        if (gc_get_refs(gc)) {
-            /* gc is definitely reachable from outside the
-             * original 'young'.  Mark it as such, and traverse
-             * its pointers to find any other objects that may
-             * be directly reachable from it.  Note that the
-             * call to tp_traverse may append objects to young,
-             * so we have to wait until it returns to determine
-             * the next object to visit.
-             */
-            PyObject *op = FROM_GC(gc);
-            traverseproc traverse = Py_TYPE(op)->tp_traverse;
-            _PyObject_ASSERT_WITH_MSG(op, gc_get_refs(gc) > 0,
-                                      "refcount is too small");
-            // NOTE: visit_reachable may change gc->_gc_next when
-            // young->_gc_prev == gc.  Don't do gc = GC_NEXT(gc) before!
-            (void) traverse(op,
-                    visit_reachable,
-                    (void *)young);
-            // relink gc_prev to prev element.
-            _PyGCHead_SET_PREV(gc, prev);
-            // gc is not COLLECTING state after here.
-            gc_clear_collecting(gc);
-            prev = gc;
-        }
-        else {
-            /* This *may* be unreachable.  To make progress,
-             * assume it is.  gc isn't directly reachable from
-             * any object we've already traversed, but may be
-             * reachable from an object we haven't gotten to yet.
-             * visit_reachable will eventually move gc back into
-             * young if that's so, and we'll see it again.
-             */
-            // Move gc to unreachable.
-            // No need to gc->next->prev = prev because it is single linked.
-            prev->_gc_next = gc->_gc_next;
+    int call_manager = (gcstate->manager_list.next != &(gcstate->manager_list));
+    while (1) {
+        while (gc != young) {
+            if (gc_get_refs(gc)) {
+                /* gc is definitely reachable from outside the
+                 * original 'young'.  Mark it as such, and traverse
+                 * its pointers to find any other objects that may
+                 * be directly reachable from it.  Note that the
+                 * call to tp_traverse may append objects to young,
+                 * so we have to wait until it returns to determine
+                 * the next object to visit.
+                 */
+                PyObject *op = FROM_GC(gc);
+                traverseproc traverse = Py_TYPE(op)->tp_traverse;
+                _PyObject_ASSERT_WITH_MSG(op, gc_get_refs(gc) > 0,
+                                          "refcount is too small");
+                // NOTE: visit_reachable may change gc->_gc_next when
+                // young->_gc_prev == gc.  Don't do gc = GC_NEXT(gc) before!
+                (void) traverse(op,
+                        visit_reachable,
+                        (void *)young);
+                // relink gc_prev to prev element.
+                _PyGCHead_SET_PREV(gc, prev);
+                // gc is not COLLECTING state after here.
+                gc_clear_collecting(gc);
+                prev = gc;
+            }
+            else {
+                /* This *may* be unreachable.  To make progress,
+                 * assume it is.  gc isn't directly reachable from
+                 * any object we've already traversed, but may be
+                 * reachable from an object we haven't gotten to yet.
+                 * visit_reachable will eventually move gc back into
+                 * young if that's so, and we'll see it again.
+                 */
+                // Move gc to unreachable.
+                // No need to gc->next->prev = prev because it is single linked.
+                prev->_gc_next = gc->_gc_next;
 
-            // We can't use gc_list_append() here because we use
-            // NEXT_MASK_UNREACHABLE here.
-            PyGC_Head *last = GC_PREV(unreachable);
-            // NOTE: Since all objects in unreachable set has
-            // NEXT_MASK_UNREACHABLE flag, we set it unconditionally.
-            // But this may pollute the unreachable list head's 'next' pointer
-            // too. That's semantically senseless but expedient here - the
-            // damage is repaired when this function ends.
-            last->_gc_next = flags | (uintptr_t)gc;
-            _PyGCHead_SET_PREV(gc, last);
-            gc->_gc_next = flags | (uintptr_t)unreachable;
-            unreachable->_gc_prev = (uintptr_t)gc;
+                // We can't use gc_list_append() here because we use
+                // NEXT_MASK_UNREACHABLE here.
+                PyGC_Head *last = GC_PREV(unreachable);
+                // NOTE: Since all objects in unreachable set has
+                // NEXT_MASK_UNREACHABLE flag, we set it unconditionally.
+                // But this may pollute the unreachable list head's 'next' pointer
+                // too. That's semantically senseless but expedient here - the
+                // damage is repaired when this function ends.
+                last->_gc_next = flags | (uintptr_t)gc;
+                _PyGCHead_SET_PREV(gc, last);
+                gc->_gc_next = flags | (uintptr_t)unreachable;
+                unreachable->_gc_prev = (uintptr_t)gc;
+            }
+            gc = _PyGCHead_NEXT(prev);
         }
-        gc = _PyGCHead_NEXT(prev);
+        if (call_manager == 0)
+            break;
+        gc_manager_analysis(gcstate);
+        gc_manager_rescue(gcstate, visit_reachable, (void*) young);
+        call_manager = 0;
     }
+            
     // young->_gc_prev must be last element remained in the list.
     young->_gc_prev = (uintptr_t)prev;
     young->_gc_next &= _PyGC_PREV_MASK;
@@ -1183,7 +1203,7 @@ flag is cleared (for example, by using 'clear_unreachable_mask' function or
 by a call to 'move_legacy_finalizers'), the 'unreachable' list is not a normal
 list and we can not use most gc_list_* functions for it. */
 static inline void
-deduce_unreachable(PyGC_Head *base, PyGC_Head *unreachable) {
+deduce_unreachable(GCState* gcstate, PyGC_Head *base, PyGC_Head *unreachable) {
     validate_list(base, collecting_clear_unreachable_clear);
     /* Using ob_refcnt and gc_refs, calculate which objects in the
      * container set are reachable from outside the set (i.e., have a
@@ -1192,6 +1212,7 @@ deduce_unreachable(PyGC_Head *base, PyGC_Head *unreachable) {
      */
     update_refs(base);  // gc_prev is used for gc_refs
     subtract_refs(base);
+    gc_manager_marking(gcstate);
 
     /* Leave everything reachable from outside base in base, and move
      * everything else (in base) to unreachable.
@@ -1228,7 +1249,7 @@ deduce_unreachable(PyGC_Head *base, PyGC_Head *unreachable) {
      * the reachable objects instead.  But this is a one-time cost, probably not
      * worth complicating the code to speed just a little.
      */
-    move_unreachable(base, unreachable);  // gc_prev is pointer again
+    move_unreachable(gcstate, base, unreachable);  // gc_prev is pointer again
     validate_list(base, collecting_clear_unreachable_clear);
     validate_list(unreachable, collecting_set_unreachable_set);
 }
@@ -1247,7 +1268,7 @@ IMPORTANT: After a call to this function, the 'still_unreachable' set will have 
 PREV_MARK_COLLECTING set, but the objects in this set are going to be removed so
 we can skip the expense of clearing the flag to avoid extra iteration. */
 static inline void
-handle_resurrected_objects(PyGC_Head *unreachable, PyGC_Head* still_unreachable,
+handle_resurrected_objects(GCState* gcstate, PyGC_Head *unreachable, PyGC_Head* still_unreachable,
                            PyGC_Head *old_generation)
 {
     // Remove the PREV_MASK_COLLECTING from unreachable
@@ -1258,7 +1279,7 @@ handle_resurrected_objects(PyGC_Head *unreachable, PyGC_Head* still_unreachable,
     // have the PREV_MARK_COLLECTING set, but the objects are going to be
     // removed so we can skip the expense of clearing the flag.
     PyGC_Head* resurrected = unreachable;
-    deduce_unreachable(resurrected, still_unreachable);
+    deduce_unreachable(gcstate, resurrected, still_unreachable);
     clear_unreachable_mask(still_unreachable);
 
     // Move the resurrected objects to the old generation for future collection.
@@ -1315,6 +1336,7 @@ gc_collect_young(PyThreadState *tstate,
                  struct gc_collection_stats *stats)
 {
     GCState *gcstate = &tstate->interp->gc;
+    gcstate->generation_collecting = 1;
     validate_spaces(gcstate);
     PyGC_Head *young = &gcstate->young.head;
     PyGC_Head *visited = &gcstate->old[gcstate->visited_space].head;
@@ -1333,6 +1355,7 @@ gc_collect_young(PyThreadState *tstate,
     PyGC_Head survivors;
     gc_list_init(&survivors);
     gc_list_set_space(young, gcstate->visited_space);
+    gc_manager_broadcast(gcstate, GCINFO_PHASE_START);
     gc_collect_region(tstate, young, &survivors, stats);
     gc_list_merge(&survivors, visited);
     validate_spaces(gcstate);
@@ -1340,6 +1363,8 @@ gc_collect_young(PyThreadState *tstate,
     gcstate->old[gcstate->visited_space].count++;
     add_stats(gcstate, 0, stats);
     validate_spaces(gcstate);
+    gc_manager_broadcast(gcstate, GCINFO_PHASE_DONE);
+    gcstate->generation_collecting = 0;
 }
 
 #ifndef NDEBUG
@@ -1604,6 +1629,7 @@ gc_collect_increment(PyThreadState *tstate, struct gc_collection_stats *stats)
 {
     GC_STAT_ADD(1, collections, 1);
     GCState *gcstate = &tstate->interp->gc;
+    gcstate->generation_collecting = 2;
     gcstate->work_to_do += assess_work_to_do(gcstate);
     untrack_tuples(&gcstate->young.head);
     if (gcstate->phase == GC_PHASE_MARK) {
@@ -1644,6 +1670,7 @@ gc_collect_increment(PyThreadState *tstate, struct gc_collection_stats *stats)
     gc_list_validate_space(&increment, gcstate->visited_space);
     PyGC_Head survivors;
     gc_list_init(&survivors);
+    gc_manager_broadcast(gcstate, GCINFO_PHASE_START);
     gc_collect_region(tstate, &increment, &survivors, stats);
     gc_list_merge(&survivors, visited);
     assert(gc_list_is_empty(&increment));
@@ -1655,6 +1682,8 @@ gc_collect_increment(PyThreadState *tstate, struct gc_collection_stats *stats)
         completed_scavenge(gcstate);
     }
     validate_spaces(gcstate);
+    gc_manager_broadcast(gcstate, GCINFO_PHASE_DONE);
+    gcstate->generation_collecting = 0;
 }
 
 static void
@@ -1663,6 +1692,7 @@ gc_collect_full(PyThreadState *tstate,
 {
     GC_STAT_ADD(2, collections, 1);
     GCState *gcstate = &tstate->interp->gc;
+    gcstate->generation_collecting = 3;
     validate_spaces(gcstate);
     PyGC_Head *young = &gcstate->young.head;
     PyGC_Head *pending = &gcstate->old[gcstate->visited_space^1].head;
@@ -1676,6 +1706,7 @@ gc_collect_full(PyThreadState *tstate,
     gc_list_merge(pending, visited);
     validate_spaces(gcstate);
 
+    gc_manager_broadcast(gcstate, GCINFO_PHASE_START);
     gc_collect_region(tstate, visited, visited,
                       stats);
     validate_spaces(gcstate);
@@ -1686,6 +1717,8 @@ gc_collect_full(PyThreadState *tstate,
     _PyGC_ClearAllFreeLists(tstate->interp);
     validate_spaces(gcstate);
     add_stats(gcstate, 2, stats);
+    gc_manager_broadcast(gcstate, GCINFO_PHASE_DONE);
+    gcstate->generation_collecting = 0;
 }
 
 /* This is the main function. Read this to understand how the
@@ -1704,8 +1737,9 @@ gc_collect_region(PyThreadState *tstate,
     assert(gcstate->garbage != NULL);
     assert(!_PyErr_Occurred(tstate));
 
+
     gc_list_init(&unreachable);
-    deduce_unreachable(from, &unreachable);
+    deduce_unreachable(gcstate, from, &unreachable);
     validate_consistent_old_space(from);
     untrack_tuples(from);
     validate_consistent_old_space(to);
@@ -1749,13 +1783,14 @@ gc_collect_region(PyThreadState *tstate,
      * objects that are still unreachable */
     PyGC_Head final_unreachable;
     gc_list_init(&final_unreachable);
-    handle_resurrected_objects(&unreachable, &final_unreachable, to);
+    handle_resurrected_objects(gcstate, &unreachable, &final_unreachable, to);
 
     /* Call tp_clear on objects in the final_unreachable set.  This will cause
     * the reference cycles to be broken.  It may also cause some objects
     * in finalizers to be freed.
     */
     stats->collected += gc_list_size(&final_unreachable);
+    gc_manager_broadcast(gcstate, GCINFO_PHASE_COLLECT);
     delete_garbage(tstate, gcstate, &final_unreachable, to);
 
     /* Collect statistics on uncollectable objects found and print
@@ -2436,3 +2471,174 @@ done:
 }
 
 #endif  // Py_GIL_DISABLED
+
+
+
+/*
+ * GC Manager Phases Contract:
+ * 
+ * 1. GCINFO_PHASE_MARK:
+ *    - Managers must visit any object which is in the GC that they want analyzable.
+ * 
+ * 2. GCINFO_PHASE_ANALYSIS:
+ *    - Managers may analyze the set of unreachable objects.
+ *    - Managers must NOT mutate the heap or rescue objects in this phase.
+ * 
+ * 3. GCINFO_PHASE_RESCUE:
+ *    - Managers must rescue all objects they intend to save in a single pass.
+ *    - No further rescue is possible after this phase.
+ *    - Managers must guarantee that any resource they promise to hold is rescued here.
+ * 
+ * 4. GCINFO_PHASE_COLLECT:
+ *    - Collection proceeds; unreachable objects not rescued are considered garbage.
+ * 
+ * 5. GCINFO_PHASE_DONE:
+ *    - Collection is complete; managers may perform any post-collection audit.
+ *
+ * This contract ensures that reference managers cannot "change their mind" after rescue,
+ * and must not allow resources to die if they are responsible for them.
+ *
+ * Note on CPython's GC Algorithm:
+ *
+ * Unlike classic mark-and-sweep collectors, CPython's cyclic GC uses a
+ * "subtracting" algorithm. During the GCINFO_PHASE_MARK phase, the collector
+ * copies reference counts and then subtracts internal references. Objects
+ * with nonzero counts after subtraction are reachable from outside the cycle.
+ *
+ * Therefore, in GCINFO_PHASE_MARK, managers must visit any objects they want
+ * included in the analysis, as only those will be properly considered for
+ * reachability in subsequent phases.
+ */
+
+
+static void gc_manager_broadcast(GCState *state, GCInfoPhase phase) {
+    if (state->manager_list.next == &(state->manager_list))
+        return;
+    GCManagerEntry *entry = state->manager_list.next;
+    GCInfo info = {0};
+
+    // Use the enum for clarity
+    info.gc_generation = state->generation_collecting;
+    info.gc_phase = phase;
+    info.visit = NULL;
+    info.visitargs = NULL;
+    info.is_collectable = NULL;
+    info.traverse = NULL;
+
+    while (entry != &(state->manager_list)) {
+        entry->manager(&info, entry->resources);
+        entry = entry->next;
+    }
+}
+
+/* This must happen immediately after subtract_refs finishes.
+
+  The reference_manager may be watched any objects that 
+  were traversed from the start of the collecting phase to 
+  infer those objects are in the generation to be collected.
+  If it used the visit proc those references become available
+  for analysis.
+*/
+static void gc_manager_marking(GCState *state) {
+    if (state->manager_list.next == &(state->manager_list))
+        return;
+
+    GCInfo info = {0};
+    info.gc_generation = state->generation_collecting;
+    info.gc_phase = GCINFO_PHASE_MARK;
+    info.visit = &visit_decref;
+    info.is_collectable = NULL;
+    info.traverse = NULL;
+
+    GCManagerEntry *entry = state->manager_list.next;
+    while (entry != &(state->manager_list)) {
+        info.visitargs = entry->resources;
+        entry->manager(&info, entry->resources);
+        entry = entry->next;
+    }
+}
+
+/* This is called immediately after the younger list runs out in the reachablity.
+
+   The reference manager is safe to use the defined methods to visit nodes and 
+   discover cross langauge links in the garbage, but it must not mutate.
+*/
+static void gc_manager_analysis(GCState *state) {
+    if (state->manager_list.next == &(state->manager_list))
+        return;
+
+    GCInfo info = {0};
+    info.gc_generation = state->generation_collecting;
+    info.gc_phase = GCINFO_PHASE_ANALYSIS;
+    info.visit = NULL;
+    info.visitargs = NULL;
+    info.is_collectable = NULL; // this needs to be a safe wey to check if an item is collectable (not reachable)
+    info.traverse = NULL; // this needs to be a procedure that allows for breath first search.   We may need to manage the resource by using the gc_prev to form a list.  They supply the visitproc, then we unmark the gc_prev
+
+    GCManagerEntry *entry = state->manager_list.next;
+    while (entry != &(state->manager_list)) {
+        entry->manager(&info, entry->resources);
+        entry = entry->next;
+    }
+}
+
+/* This is called after the younger list runs out in the reachablity and analysis is complete.
+
+   The rescue manager must rescue everything it promised to hold for the bridge in one pass.
+*/
+
+static void gc_manager_rescue(GCState *state, visitproc rescue, void* younger) {
+    if (state->manager_list.next == &(state->manager_list))
+        return;
+
+    GCInfo info = {0};
+    info.gc_generation = state->generation_collecting;
+    info.gc_phase = GCINFO_PHASE_RESCUE;
+    info.visit = rescue;
+    info.visitargs = younger;
+    info.is_collectable = NULL;
+    info.traverse = NULL;
+
+    GCManagerEntry *entry = state->manager_list.next;
+    while (entry != &(state->manager_list)) {
+        entry->manager(&info, entry->resources);
+        entry = entry->next;
+    }
+}
+
+
+void PyUnstable_GC_InstallReferenceManager(gc_managerproc manager, PyObject* resources) {
+    GCState *gcstate = get_gc_state();
+
+    GCManagerEntry *node = PyMem_Malloc(sizeof(GCManagerEntry));
+    if (!node) {
+        PyErr_NoMemory();
+        return;
+    }
+    node->manager = manager;
+    node->resources = resources;
+    Py_INCREF(node->resources);
+
+    // Insert at the tail (before the sentinel)
+    node->next = &gcstate->manager_list;
+    node->prev = gcstate->manager_list.prev;
+    gcstate->manager_list.prev->next = node;
+    gcstate->manager_list.prev = node;
+}
+
+void PyUnstable_GC_RemoveReferenceManager(gc_managerproc manager, PyObject* resources) {
+    GCState *gcstate = get_gc_state();
+    GCManagerEntry *node = gcstate->manager_list.next;
+
+    while (node != &gcstate->manager_list) {
+        if (node->manager == manager && node->resources == resources) {
+            Py_DECREF(node->resources);
+            // Remove node from list
+            node->prev->next = node->next;
+            node->next->prev = node->prev;
+            PyMem_Free(node);
+            return;
+        }
+        node = node->next;
+    }
+}

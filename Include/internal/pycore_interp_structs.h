@@ -197,6 +197,17 @@ enum _GCPhase {
     GC_PHASE_COLLECT = 1
 };
 
+struct _gc_manager_info;
+typedef int (*_gc_managerproc)(struct _gc_manager_info*, PyObject* args);
+
+struct _gc_manager_node {
+    struct _gc_manager_node *prev;
+    struct _gc_manager_node *next;
+    _gc_managerproc manager;
+    PyObject* args;
+};
+
+
 /* If we change this, we need to change the default value in the
    signature of gc.collect. */
 #define NUM_GENERATIONS 3
@@ -229,6 +240,9 @@ struct _gc_runtime_state {
     /* Which of the old spaces is the visited space */
     int visited_space;
     int phase;
+
+	struct _gc_manager_node manager_list;
+	int generation_collecting;
 
 #ifdef Py_GIL_DISABLED
     /* This is the number of objects that survived the last full
