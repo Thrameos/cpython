@@ -204,7 +204,7 @@ struct _gc_manager_node {
     struct _gc_manager_node *prev;
     struct _gc_manager_node *next;
     _gc_managerproc manager;
-    PyObject* args;
+    PyObject* resources;
 };
 
 

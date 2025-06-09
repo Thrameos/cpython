@@ -155,7 +155,7 @@ get_gc_state(void)
 
 static void gc_manager_broadcast(GCState *state, GCInfoPhase phase);
 static void gc_manager_marking(GCState *state);
-static void gc_manager_analysis(GCState *state);
+static void gc_manager_analysis(GCState *state, PyGC_Head* unreachable);
 static void gc_manager_rescue(GCState *state, visitproc proc, void* args);
 
 void
@@ -750,7 +750,7 @@ move_unreachable(GCState* gcstate, PyGC_Head *young, PyGC_Head *unreachable)
         }
         if (call_manager == 0)
             break;
-        gc_manager_analysis(gcstate);
+        gc_manager_analysis(gcstate, unreachable);
         gc_manager_rescue(gcstate, visit_reachable, (void*) young);
         call_manager = 0;
     }
@@ -1336,7 +1336,7 @@ gc_collect_young(PyThreadState *tstate,
                  struct gc_collection_stats *stats)
 {
     GCState *gcstate = &tstate->interp->gc;
-    gcstate->generation_collecting = 1;
+    gcstate->generation_collecting = 0;
     validate_spaces(gcstate);
     PyGC_Head *young = &gcstate->young.head;
     PyGC_Head *visited = &gcstate->old[gcstate->visited_space].head;
@@ -1364,7 +1364,7 @@ gc_collect_young(PyThreadState *tstate,
     add_stats(gcstate, 0, stats);
     validate_spaces(gcstate);
     gc_manager_broadcast(gcstate, GCINFO_PHASE_DONE);
-    gcstate->generation_collecting = 0;
+    gcstate->generation_collecting = -1;
 }
 
 #ifndef NDEBUG
@@ -1629,7 +1629,7 @@ gc_collect_increment(PyThreadState *tstate, struct gc_collection_stats *stats)
 {
     GC_STAT_ADD(1, collections, 1);
     GCState *gcstate = &tstate->interp->gc;
-    gcstate->generation_collecting = 2;
+    gcstate->generation_collecting = 1;
     gcstate->work_to_do += assess_work_to_do(gcstate);
     untrack_tuples(&gcstate->young.head);
     if (gcstate->phase == GC_PHASE_MARK) {
@@ -1683,7 +1683,7 @@ gc_collect_increment(PyThreadState *tstate, struct gc_collection_stats *stats)
     }
     validate_spaces(gcstate);
     gc_manager_broadcast(gcstate, GCINFO_PHASE_DONE);
-    gcstate->generation_collecting = 0;
+    gcstate->generation_collecting = -1;
 }
 
 static void
@@ -1692,7 +1692,7 @@ gc_collect_full(PyThreadState *tstate,
 {
     GC_STAT_ADD(2, collections, 1);
     GCState *gcstate = &tstate->interp->gc;
-    gcstate->generation_collecting = 3;
+    gcstate->generation_collecting = 2;
     validate_spaces(gcstate);
     PyGC_Head *young = &gcstate->young.head;
     PyGC_Head *pending = &gcstate->old[gcstate->visited_space^1].head;
@@ -1718,7 +1718,7 @@ gc_collect_full(PyThreadState *tstate,
     validate_spaces(gcstate);
     add_stats(gcstate, 2, stats);
     gc_manager_broadcast(gcstate, GCINFO_PHASE_DONE);
-    gcstate->generation_collecting = 0;
+    gcstate->generation_collecting = -1;
 }
 
 /* This is the main function. Read this to understand how the
@@ -2511,6 +2511,78 @@ done:
  */
 
 
+struct _gc_manager_info_extended {
+    struct _gc_manager_info _info;
+    PyGC_Head *unreachable;
+    PyGC_Head tovisit;
+    PyGC_Head visited;
+};
+
+static int gc_manager_enqueue_if_needed(PyObject *child, void *arg) {
+    struct _gc_manager_info_extended *ctx = (struct _gc_manager_info_extended *)arg;
+    if (_PyObject_IS_GC(child)) {
+        PyGC_Head *gc_obj = AS_GC(child);
+        if (gc_obj->_gc_next & NEXT_MASK_UNREACHABLE) {
+            gc_obj->_gc_next &= ~NEXT_MASK_UNREACHABLE;
+            gc_list_move(gc_obj, &ctx->tovisit);
+        }
+    }
+    return 0;
+}
+
+int gc_manager_traverse(PyObject *starthere, visitproc theirvisitor, void *args)
+{
+    struct _gc_manager_info_extended *ctx = (struct _gc_manager_info_extended *)args;
+    gc_list_init(&ctx->tovisit);
+    gc_list_init(&ctx->visited);
+
+    if (starthere && _PyObject_IS_GC(starthere)) {
+        PyGC_Head *start_gc = AS_GC(starthere);
+        if (start_gc->_gc_next & NEXT_MASK_UNREACHABLE) {
+            start_gc->_gc_next &= ~NEXT_MASK_UNREACHABLE;
+            gc_list_move(start_gc, &ctx->tovisit);
+        }
+    }
+
+    int error = 0;
+    while (!gc_list_is_empty(&ctx->tovisit)) {
+        PyGC_Head *gc = GC_NEXT(&ctx->tovisit);
+        gc_list_move(gc, &ctx->visited);
+
+        if (theirvisitor) {
+            error = theirvisitor(FROM_GC(gc), ctx->_info.visitargs);
+            if (error) break;
+        }
+
+        PyObject *op = FROM_GC(gc);
+        traverseproc traverse = Py_TYPE(op)->tp_traverse;
+        if (traverse) {
+            error = traverse(op, gc_manager_enqueue_if_needed, ctx);
+            if (error) break;
+        }
+    }
+
+    // Always restore NEXT_MASK_UNREACHABLE on visited objects
+    for (PyGC_Head *gc = GC_NEXT(&ctx->visited); gc != &ctx->visited; gc = GC_NEXT(gc)) {
+        gc->_gc_next |= NEXT_MASK_UNREACHABLE;
+    }
+    gc_list_merge(&ctx->visited, ctx->unreachable);
+
+    return error;
+}
+
+static int
+gc_manager_is_collectable(PyObject *obj)
+{
+    if (!_PyObject_IS_GC(obj)) {
+        return 0;
+    }
+    PyGC_Head *gc = AS_GC(obj);
+    // NEXT_MASK_UNREACHABLE means it's still in the unreachable set
+    return (gc->_gc_next & NEXT_MASK_UNREACHABLE) != 0;
+}
+
+
 static void gc_manager_broadcast(GCState *state, GCInfoPhase phase) {
     if (state->manager_list.next == &(state->manager_list))
         return;
@@ -2521,6 +2593,7 @@ static void gc_manager_broadcast(GCState *state, GCInfoPhase phase) {
     info.gc_generation = state->generation_collecting;
     info.gc_phase = phase;
     info.visit = NULL;
+    info.visit_next = (phase==GCINFO_PHASE_START)?&visit_decref:NULL;
     info.visitargs = NULL;
     info.is_collectable = NULL;
     info.traverse = NULL;
@@ -2547,6 +2620,7 @@ static void gc_manager_marking(GCState *state) {
     info.gc_generation = state->generation_collecting;
     info.gc_phase = GCINFO_PHASE_MARK;
     info.visit = &visit_decref;
+    info.visit_next = &visit_reachable;
     info.is_collectable = NULL;
     info.traverse = NULL;
 
@@ -2563,24 +2637,28 @@ static void gc_manager_marking(GCState *state) {
    The reference manager is safe to use the defined methods to visit nodes and 
    discover cross langauge links in the garbage, but it must not mutate.
 */
-static void gc_manager_analysis(GCState *state) {
+static void gc_manager_analysis(GCState *state, PyGC_Head* unreachable) {
     if (state->manager_list.next == &(state->manager_list))
         return;
 
-    GCInfo info = {0};
-    info.gc_generation = state->generation_collecting;
-    info.gc_phase = GCINFO_PHASE_ANALYSIS;
-    info.visit = NULL;
-    info.visitargs = NULL;
-    info.is_collectable = NULL; // this needs to be a safe wey to check if an item is collectable (not reachable)
-    info.traverse = NULL; // this needs to be a procedure that allows for breath first search.   We may need to manage the resource by using the gc_prev to form a list.  They supply the visitproc, then we unmark the gc_prev
+    struct _gc_manager_info_extended info = {0};
+    info._info.gc_generation = state->generation_collecting;
+    info._info.gc_phase = GCINFO_PHASE_ANALYSIS;
+    info._info.is_collectable = gc_manager_is_collectable;
+    info._info.traverse = gc_manager_traverse;
+    info._info.visit_next = NULL;
+    info.unreachable = unreachable;
+    // No need to initialize tovisit/visited here; traverse will do that.
 
     GCManagerEntry *entry = state->manager_list.next;
     while (entry != &(state->manager_list)) {
-        entry->manager(&info, entry->resources);
+        info._info.visit = NULL;
+        info._info.visitargs = NULL;
+        entry->manager(&(info._info), entry->resources);
         entry = entry->next;
     }
 }
+
 
 /* This is called after the younger list runs out in the reachablity and analysis is complete.
 
@@ -2594,8 +2672,9 @@ static void gc_manager_rescue(GCState *state, visitproc rescue, void* younger) {
     GCInfo info = {0};
     info.gc_generation = state->generation_collecting;
     info.gc_phase = GCINFO_PHASE_RESCUE;
-    info.visit = rescue;
+    info.visit = visit_reachable;
     info.visitargs = younger;
+    info.visit_next = NULL;
     info.is_collectable = NULL;
     info.traverse = NULL;
 

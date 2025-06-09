@@ -40,9 +40,17 @@ typedef struct _gc_manager_info {
     /*
      * The visit method to be executed at this phase of the collection.
      * Used to traverse or process objects.
+     *
+	 * During analysis phase the user must set their visit and visitargs.
+     * During collect and rescue the gc will supply.
      */
     visitproc visit;
-    void* visitargs;
+    void* visitargs; 
+
+	/* The visitor that will be used between phases.  This is used to 
+     * identify when outgoing leases need to renew themselves.
+     */
+	visitproc visit_next;
 
     /*
      * Query function to determine if an object is collectable in this phase.
